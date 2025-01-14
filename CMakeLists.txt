@@ -736,6 +736,7 @@ set(SOURCES
         util/trace_replay.cc
         util/transaction_test_util.cc
         util/xxhash.cc
+        util/zipf.cc
         utilities/backupable/backupable_db.cc
         utilities/checkpoint/checkpoint_impl.cc
         utilities/col_buf_decoder.cc

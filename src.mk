@@ -183,6 +183,7 @@ LIB_SOURCES =                                                   \
   util/trace_replay.cc                                          \
   util/transaction_test_util.cc                                 \
   util/xxhash.cc                                                \
+  util/zipf.cc                                                  \
   utilities/backupable/backupable_db.cc                         \
   utilities/cassandra/cassandra_compaction_filter.cc            \
   utilities/cassandra/format.cc                                 \

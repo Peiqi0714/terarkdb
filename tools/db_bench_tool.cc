@@ -81,6 +81,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
 #include "utilities/trace/bytedance_metrics_reporter.h"
+#include "util/zipf.h"
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
@@ -604,6 +605,10 @@ DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
 
+DEFINE_bool(zipfian, false, "Have a zipfian distribution or not.");
+
+DEFINE_double(zipf_const, 0.99, "Zipfian const when have a zipfian distribution.");
+
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
 DEFINE_string(truth_db, "/dev/shm/truth_db/dbbench",
@@ -945,6 +950,17 @@ DEFINE_double(sine_b, 1, "B in f(x) = A sin(bx + c) + d");
 DEFINE_double(sine_c, 0, "C in f(x) = A sin(bx + c) + d");
 
 DEFINE_double(sine_d, 1, "D in f(x) = A sin(bx + c) + d");
+
+DEFINE_int64(ycsb_num, -1, "Number of ycsb keys(if -1, means use --num)");
+
+DEFINE_double(ycsb_warmup_ratio, 0, "ycsb warm up ratio");
+
+DEFINE_double(ycsb_zipf_const, 0.9, "ycsb zipfian constant");
+
+DEFINE_bool(ycsb_uniform_distribution, false,
+            "Use uniform distribution for YCSB workload");
+
+DEFINE_int32(ycsb_readwritepercent, 50, "Ratio of reads to reads/writes for ycsb");
 
 DEFINE_bool(rate_limit_bg_reads, false,
             "Use options.rate_limiter on compaction reads");
@@ -2095,6 +2111,7 @@ class Benchmark {
   int64_t readwrites_;
   int64_t merge_keys_;
   bool report_file_operations_;
+  std::vector<uint64_t> **threadKeys_;
 
   class ErrorHandlerListener : public EventListener {
    public:
@@ -2421,7 +2438,8 @@ class Benchmark {
                 ? FLAGS_num
                 : ((FLAGS_writes > FLAGS_reads) ? FLAGS_writes : FLAGS_reads)),
         merge_keys_(FLAGS_merge_keys < 0 ? FLAGS_num : FLAGS_merge_keys),
-        report_file_operations_(FLAGS_report_file_operations) {
+        report_file_operations_(FLAGS_report_file_operations),
+        threadKeys_(nullptr) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -2489,6 +2507,23 @@ class Benchmark {
     const char* const_data = data;
     key_guard->reset(const_data);
     return Slice(key_guard->get(), key_size_);
+  }
+  
+  void GenerateKeyFromInt(uint64_t v, Slice* key) {
+    char* start = const_cast<char*>(key->data());
+    char* pos = start;
+    int bytes_to_fill = std::min(key_size_ - static_cast<int>(pos - start), 8);
+    if (port::kLittleEndian) {
+      for (int i = 0; i < bytes_to_fill; ++i) {
+        pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+      }
+    } else {
+      memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
+    }
+    pos += bytes_to_fill;
+    if (key_size_ > pos - start) {
+      memset(pos, '0', key_size_ - (pos - start));
+    }
   }
 
   // Generate key according to the given specification and random number.
@@ -2708,6 +2743,34 @@ class Benchmark {
         num_ /= 1000;
         write_options_.sync = true;
         method = &Benchmark::WriteRandom;
+      } else if (name == "ycsbwklda") {
+        FLAGS_use_existing_db = true;
+        //FLAGS_ycsb_warmup_ratio = 0.5
+        method = &Benchmark::YCSBWorkloadA;
+      } else if (name == "ycsbwkldb") {
+        FLAGS_use_existing_db = true;
+        //FLAGS_ycsb_warmup_ratio = 0.5
+        method = &Benchmark::YCSBWorkloadB;
+      } else if (name == "ycsbwkldc") {
+        FLAGS_use_existing_db = true;
+        //FLAGS_ycsb_warmup_ratio = 0.5
+        method = &Benchmark::YCSBWorkloadC;
+      } else if (name == "ycsbwkldd") {
+        FLAGS_use_existing_db = true;
+        //FLAGS_ycsb_warmup_ratio = 0.5
+        method = &Benchmark::YCSBWorkloadD;
+      } else if (name == "ycsbwklde") {
+        FLAGS_use_existing_db = true;
+        method = &Benchmark::YCSBWorkloadE;
+      } else if (name == "ycsbwkldf") {
+        FLAGS_use_existing_db = true;
+        method = &Benchmark::YCSBWorkloadF;
+      } else if (name == "ycsbfilldb") {
+        fresh_db = true;
+        method = &Benchmark::YCSBFillDB;
+      } else if (name == "ycsbupdate") {
+        FLAGS_use_existing_db = true;
+        method = &Benchmark::YCSBUpdate;
       } else if (name == "fill100K") {
         fresh_db = true;
         num_ /= 1000;
@@ -3010,6 +3073,48 @@ class Benchmark {
                                              FLAGS_report_interval_seconds));
     }
 
+    const auto name_str = std::string(name.data());
+    if ((name != Slice("ycsbfilldb")) && (name_str.find("ycsb") != std::string::npos)) {
+      threadKeys_ = new std::vector<uint64_t>*[n];
+      for (int i = 0; i < n; i++) {
+					threadKeys_[i] = new std::vector<uint64_t>;
+			}
+      fprintf(stderr, "workload %s: prepare keys now!\n", name.ToString().c_str());
+      Random rand = Random(1000);  // supply a seed 
+			RandomGenerator gen;
+			//ReadOptions options;
+				
+		  // Prepare read keys
+			init_zipf_generator(0, FLAGS_num, FLAGS_ycsb_zipf_const);
+
+      long shard_size = FLAGS_num/FLAGS_threads;
+      if (FLAGS_ycsb_num == -1) {
+        FLAGS_ycsb_num = FLAGS_num;
+      }
+
+      for (int i = 0; i < FLAGS_ycsb_num; i++) {
+        uint64_t k;
+        if (FLAGS_ycsb_uniform_distribution) { //Generate number from uniform distribution
+          //fprintf(stderr, "random distribution\n");
+          k = rand.Next() % FLAGS_num;
+        } else { //Default: Generate number from zipf distribution
+          uint64_t temp = nextValue() % FLAGS_num;
+          std::hash<std::string> hash_str;
+          k = hash_str(std::to_string(temp))% FLAGS_num;
+        }
+        //fprintf(stderr, "Generate %llu\n", k);
+
+        int p = k / shard_size;
+        if (p >= n || p < 0) {
+          continue;
+        }
+        threadKeys_[p]->push_back(k);
+      }
+      for (int i = 0; i < n; i++) {
+				fprintf(stderr, "thread %d has %zu keys\n", i, threadKeys_[i]->size());
+			}
+    }
+
     ThreadArg* arg = new ThreadArg[n];
 
     for (int i = 0; i < n; i++) {
@@ -3058,6 +3163,16 @@ class Benchmark {
       merge_stats.Merge(arg[i].thread->stats);
     }
     merge_stats.Report(name);
+
+    if ((name != Slice("ycsbfilldb")) && (name_str.find("ycsb") != std::string::npos)) {
+      for (int i = 0; i < n; i++) {
+        threadKeys_[i]->clear();
+				threadKeys_[i]->shrink_to_fit();
+        delete threadKeys_[i];
+      }
+      delete[] threadKeys_;
+    }
+
     for (int i = 0; i < n; i++) {
       delete arg[i].thread;
     }
@@ -3947,6 +4062,9 @@ class Benchmark {
     }
 
     Duration duration(test_duration, max_ops, ops_per_stage);
+    if (FLAGS_zipfian) {
+      init_zipf_generator(0, FLAGS_num, FLAGS_zipf_const);
+    }
     for (size_t i = 0; i < num_key_gens; i++) {
       key_gens[i].reset(new KeyGenerator(&(thread->rand), write_mode,
                                          num_ + max_num_range_tombstones_,
@@ -4013,6 +4131,11 @@ class Benchmark {
           GenerateKeyFromInt(rand_num, FLAGS_num, &key, thread->tid);
         else
           GenerateKeyFromInt(rand_num, FLAGS_num, &key, -1);
+        if (FLAGS_zipfian) {
+          rand_num = nextValue() % FLAGS_num;
+          Random64 rand_local(rand_num);
+          rand_num = rand_local.Next() % FLAGS_num;
+        }
         if (FLAGS_num_column_families <= 1) {
           batch.Put(key, gen.Generate(value_size_));
         } else {
@@ -5428,6 +5551,620 @@ class Benchmark {
       assert(iter->Valid() && iter->key() == key);
       thread->stats.FinishedOps(nullptr, db, 1, kSeek);
     }
+  }
+
+  void YCSBFillDB(ThreadState* thread) {
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(%ld ops)", FLAGS_num);
+    thread->stats.AddMessage(msg);
+
+    //RandomGenerator gen;
+    int64_t bytes = 0;
+    long shard_size = FLAGS_num / FLAGS_threads;
+    long low = thread->tid * shard_size;
+    std::vector<long> keys;
+    for (long k = low; k < (low + shard_size); k++){
+			keys.push_back(k);
+	  }
+		unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+		shuffle(keys.begin(), keys.end(), std::default_random_engine(seed));
+    // the number of iterations is the larger of read_ or write_
+
+    for (int i = 0; i < shard_size; i++) {
+      long k = keys.at(i);
+      //std::cout<<k<<std::endl;
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // write
+      bytes += value_size_ + key.size();
+
+      // char key_buf[8];
+      // char val_buf[1024];
+      // memcpy(key_buf, key.data(), key.size());
+      // Slice value_slice = gen.Generate(value_size);
+      // //std::cout<<"value: "<<value_slice.data()[0]<<std::endl;
+      // for (int ii = 0; ii < value_slice.size(); ii++) {
+      //   val_buf[ii] = value_slice.data()[ii];
+      // } 
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", k);
+      // bytes += value_size + strlen(key);
+      char val_char[1024] = {0};
+      sprintf(val_char, "%ld", k);      
+      Slice val = Slice(val_char, value_size_);
+
+      Status s = db_.db->Put(write_options_, key, val);
+      thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }
+      // printf("K= %d\n", k);
+    }
+    thread->stats.AddBytes(bytes);
+  }
+
+  void YCSBUpdate(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::string value;
+    int found = 0;
+
+    int64_t bytes = 0;
+    int writes_done = 0;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+    int warm_up_num = total * FLAGS_ycsb_warmup_ratio;
+    fprintf(stderr, "start warmup: %d entries\n", warm_up_num);
+    fprintf(stderr, "end warmup: %d entries\n", warm_up_num);
+    // the number of iterations is the larger of read_ or write_
+    if (FLAGS_ycsb_warmup_ratio != 0) {
+      thread->stats.Start(thread->tid);//warm up之后重新计时
+    }
+    for (int i = warm_up_num; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      bytes += value_size_ + key.size();
+
+      char val_char[1024] = {0};
+      sprintf(val_char, "%d", k);        
+      Slice val = Slice(val_char, value_size_);
+
+      Status s = db_.db->Put(write_options_, key, val);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      } else {
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+      }
+        
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(writes: %d)", writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+
+  // Workload A: Update heavy workload
+  // This workload has a mix of 50/50 reads and writes.
+  // An application example is a session store recording recent actions.
+  // Read/update ratio: 50/50
+  // Default data size: 1 KB records
+  // Request distribution: zipfian
+  void YCSBWorkloadA(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::string value;
+    int found = 0;
+
+    int64_t bytes = 0;
+    int reads_done = 0;
+    int writes_done = 0;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+    int warm_up_num = total * FLAGS_ycsb_warmup_ratio;
+    fprintf(stderr, "start warmup: %d entries\n", warm_up_num);
+    for (int i = 0; i < warm_up_num; i++) {
+      int k = keys->at(i);
+      //std::cout<<"rand: "<<rand_tmp<<std::endl;
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      //std::cout<<"write"<<std::endl;
+      char val_char[1024] = {0};
+      sprintf(val_char, "%d", k);      Slice val = Slice(val_char, value_size_);
+      Status s = db_.db->Put(write_options_, key, val);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }      
+    
+    }
+    fprintf(stderr, "end warmup: %d entries\n", warm_up_num);
+    // the number of iterations is the larger of read_ or write_
+    if (FLAGS_ycsb_warmup_ratio != 0) {
+      thread->stats.Start(thread->tid);//warm up之后重新计时
+    }
+    for (int i = warm_up_num; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      bytes += value_size_ + key.size();
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < FLAGS_ycsb_readwritepercent) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        Status s = db_.db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          // fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        }
+        reads_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        // char key_buf[8];
+        // char val_buf[1024];
+        // memcpy(key_buf, key.data(), key.size());
+        // Slice value_slice = gen.Generate(value_size);
+        // std::cout<<"value: "<<value_slice.data()[0]<<std::endl;
+        // for (int ii = 0; ii < value_slice.size(); ii++) {
+        //   val_buf[ii] = value_slice.data()[ii];
+        // }
+        //memcpy(val_buf, value_slice.data(), value_slice.size());
+        char val_char[1024] = {0};
+        sprintf(val_char, "%d", k);        Slice val = Slice(val_char, value_size_);
+
+        Status s = db_.db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(reads: %d of %d found. writes: %d)", found,
+             reads_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+
+  //95read/5update
+  void YCSBWorkloadB(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+
+    std::string value;
+    int found = 0;
+    int64_t bytes = 0;
+    int reads_done = 0;
+    int writes_done = 0;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+
+    int warm_up_num = total * FLAGS_ycsb_warmup_ratio;
+    fprintf(stderr, "start warmup: %d entries\n", warm_up_num);
+    for (int i = 0; i < warm_up_num; i++) {
+      int k = keys->at(i);
+      //std::cout<<"rand: "<<rand_tmp<<std::endl;
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      //std::cout<<"write"<<std::endl;
+      char val_char[1024] = {0};
+      sprintf(val_char, "%d", k);      Slice val = Slice(val_char, value_size_);
+      Status s = db_.db->Put(write_options_, key, val);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }      
+    
+    }
+    fprintf(stderr, "end warmup: %d entries\n", warm_up_num);
+    if (FLAGS_ycsb_warmup_ratio != 0) {
+      thread->stats.Start(thread->tid);//warm up之后重新计时
+    }
+
+    // the number of iterations is the larger of read_ or write_
+    for (int i = warm_up_num; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      bytes += value_size_ + key.size();
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        Status s = db_.db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          // fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        }
+        reads_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        char val_char[1024] = {0};
+        sprintf(val_char, "%d", k);        Slice val = Slice(val_char, value_size_);
+        Status s = db_.db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(reads: %d of %d found. writes: %d)", found,
+             reads_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+
+  //100read
+  void YCSBWorkloadC(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+
+    std::string value;
+    int found = 0;
+    int64_t bytes = 0;
+    int reads_done = 0;
+    int writes_done = 0;
+    int warm_up_num = total * FLAGS_ycsb_warmup_ratio;
+
+    fprintf(stderr, "start warmup: %d entries\n", warm_up_num);
+    for (int i = 0; i < warm_up_num; i++) {
+      int k = keys->at(i);
+      //std::cout<<"rand: "<<rand_tmp<<std::endl;
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      //std::cout<<"write"<<std::endl;
+      char val_char[1024] = {0};
+      sprintf(val_char, "%d", k);      
+      Slice val = Slice(val_char, value_size_);
+      Status s = db_.db->Put(write_options_, key, val);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }      
+    
+    }
+    fprintf(stderr, "end warmup: %d entries\n", warm_up_num);
+    if (FLAGS_ycsb_warmup_ratio != 0) {
+      thread->stats.Start(thread->tid);//warm up之后重新计时
+    }
+
+    // the number of iterations is the larger of read_ or write_
+    for (int i = warm_up_num; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      bytes += value_size_ + key.size();
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 100) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        Status s = db_.db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          // fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        }
+        reads_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        char val_char[1024] = {0};
+        sprintf(val_char, "%d", k);        
+        Slice val = Slice(val_char, value_size_);
+        Status s = db_.db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(reads: %d of %d found. writes: %d)", found,
+             reads_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+
+  //Read/update/insert ratio: 95/0/5
+  void YCSBWorkloadD(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+    int64_t bytes = 0;
+    std::string value;
+    int found = 0;
+
+    int reads_done = 0;
+    int writes_done = 0;
+
+    int warm_up_num = total * FLAGS_ycsb_warmup_ratio;
+
+    fprintf(stderr, "start warmup: %d entries\n", warm_up_num);
+    for (int i = 0; i < warm_up_num; i++) {
+      int k = keys->at(i);
+      //std::cout<<"rand: "<<rand_tmp<<std::endl;
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      //std::cout<<"write"<<std::endl;
+      char val_char[1024] = {0};
+      sprintf(val_char, "%d", k);      
+      Slice val = Slice(val_char, value_size_);
+      Status s = db_.db->Put(write_options_, key, val);
+      if (!s.ok()) {
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        exit(1);
+      }      
+    
+    }
+    fprintf(stderr, "end warmup: %d entries\n", warm_up_num);
+    if (FLAGS_ycsb_warmup_ratio != 0) {
+      thread->stats.Start(thread->tid);//warm up之后重新计时
+    }
+
+    for (int i = warm_up_num; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      bytes += value_size_ + key.size();
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        Status s = db_.db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          // fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        }
+        reads_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        char val_char[1024] = {0};
+        sprintf(val_char, "%d", k);        
+        Slice val = Slice(val_char, value_size_);
+        Status s = db_.db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(reads: %d of %d found. writes: %d)", found,
+             reads_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+
+  //95scan,5write
+  void YCSBWorkloadE(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+
+    std::string value;
+    int found = 0;
+    int64_t bytes = 0;
+    int scans_done = 0;
+    int writes_done = 0;
+    for (int i = 0; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        //std::vector<std::pair<Slice, Slice>> results;
+
+        // generate the scan size from a uniform distribution between [1, 100]
+        uint64_t scan_size = (thread->rand.Next() % 100) + 1;
+        bytes += (value_size_ + key.size()) * scan_size;
+        Iterator* iter = db_.db->NewIterator(options);
+        iter->Seek(key);
+        uint64_t j;
+        for (j = 0; j < scan_size && iter->Valid(); j++) {       
+          iter->Next();
+        }
+        
+        if (j == scan_size) {
+          found++;
+        }
+        delete iter;
+        thread->stats.FinishedOps(nullptr, db_.db, 1, kSeek);
+        //Status s = db->Scan(options, key, scan_size, &results);
+        // if (!s.ok() && !s.IsNotFound()) {
+        //   // fprintf(stderr, "start_key=%d; scan error: %s\n", k, s.ToString().c_str());
+        //   // exit(1);
+        //   //  we continue after error rather than exiting so that we can
+        //   //  find more errors if any
+        // } else if (!s.IsNotFound()) {
+        //   found++;
+        //   thread->stats.FinishedOps(nullptr, db, 1, kSeek);
+        // }
+        scans_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        char val_char[1024] = {0};
+        sprintf(val_char, "%d", k);        
+        Slice val = Slice(val_char, value_size_);
+        bytes += value_size_ + key.size();
+        Status s = db_.db->Put(write_options_, key, val);
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kWrite);
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(scans: %d of %d found. writes: %d)", found,
+             scans_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
+  }
+  //Workload F: 50% reads, 50% rmw
+  void YCSBWorkloadF(ThreadState* thread) {
+    //RandomGenerator gen;
+    ReadOptions options;
+    std::vector<uint64_t> *keys = threadKeys_[thread->tid];
+    int total = keys->size();
+
+    std::string value;
+    int found = 0;
+    int64_t bytes = 0;
+    int reads_done = 0;
+    int writes_done = 0;
+    // the number of iterations is the larger of read_ or write_
+    for (int i = 0; i < total; i++) {
+      int k = keys->at(i);
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      GenerateKeyFromInt(k, &key);
+      // char key[8];
+      // snprintf(key, sizeof(key), "%016d", rand_tmp);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50) {
+        // read
+        //std::cout<<"read"<<std::endl;
+        bytes += value_size_ + key.size();
+        Status s = db_.db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          // fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          thread->stats.FinishedOps(nullptr, db_.db, 1, kRead);
+        }
+        reads_done++;
+        
+
+      } else {
+        //std::cout<<"write"<<std::endl;
+        bytes += value_size_ + key.size(); 
+        Status s1 = db_.db->Get(options, key, &value);
+        if (!s1.ok() && !s1.IsNotFound()) {
+          // fprintf(stderr, "get error: %s\n", s1.ToString().c_str());
+          // exit(1);
+        } else if (!s1.IsNotFound()) {
+          found++;
+          reads_done++;
+          char val_char[1024] = {0};
+          sprintf(val_char, "%d", k);          
+          Slice val = Slice(val_char, value_size_);
+          bytes += value_size_ + key.size();
+          Status s2 = db_.db->Put(write_options_, key, val);
+          if (!s2.ok()) {
+            //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+            //exit(1);
+          } else{
+            writes_done++;
+            thread->stats.FinishedOps(nullptr, db_.db, 1, kUpdate);
+          }
+        }
+        
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(reads: %d of %d found. writes: %d)", found,
+             reads_done, writes_done);
+    thread->stats.AddMessage(msg);
+    thread->stats.AddBytes(bytes);
   }
 
 #ifndef ROCKSDB_LITE
