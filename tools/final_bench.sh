@@ -24,9 +24,9 @@ rm -rf /users/peiqi714/test/base_log/*
 rm -rf /users/peiqi714/test/db/*
 thread_count=1
 echo "start final exp base"
+for read_count in 5000000
 do
     entry_count=50000000
-    read_count=5000000
     echo "entry count: $entry_count"
     echo "read count: $read_count"
 
